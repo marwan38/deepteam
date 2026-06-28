@@ -1,4 +1,5 @@
 from typing import List, Dict, Any, Optional, Tuple, Union
+from dataclasses import dataclass, field
 from uuid import uuid4
 import json
 import random
@@ -57,6 +58,27 @@ class MemorySystem:
         return new_conversation_id
 
 
+@dataclass
+class CrescendoConversation:
+    """Per-attack conversation state.
+
+    A single CrescendoJailbreaking instance is reused across every test case that
+    samples it, and those test cases run concurrently (asyncio.gather). Holding the
+    memory and conversation ids on the instance let concurrent attacks write into
+    one shared buffer, bleeding other vulnerabilities' turns into the attacker
+    prompt. Allocating this fresh per _get_turns/_a_get_turns call keeps each
+    conversation isolated.
+    """
+
+    simulator_model: DeepEvalBaseLLM
+    model_callback: CallbackType
+    memory: MemorySystem = field(default_factory=MemorySystem)
+    target_conversation_id: str = field(default_factory=lambda: str(uuid4()))
+    red_teaming_chat_conversation_id: str = field(
+        default_factory=lambda: str(uuid4())
+    )
+
+
 class CrescendoJailbreaking(BaseMultiTurnAttack):
     name = "Crescendo Jailbreaking"
     exploitability = Exploitability.LOW
@@ -72,11 +94,12 @@ class CrescendoJailbreaking(BaseMultiTurnAttack):
     ):
         self.weight = weight
         self.multi_turn = True
-        self.memory = MemorySystem()
-        self.target_conversation_id = str(uuid4())
-        self.red_teaming_chat_conversation_id = str(uuid4())
         self.max_rounds = max_rounds
         self.max_backtracks = max_backtracks
+        # Configured default simulator. Per-conversation state (memory,
+        # conversation ids, the resolved simulator/callback) lives on a
+        # CrescendoConversation created per call, never on the instance, so one
+        # instance can be reused across concurrent attacks without state bleed.
         self.simulator_model = simulator_model
         self.turn_level_attacks = turn_level_attacks
 
@@ -100,11 +123,13 @@ class CrescendoJailbreaking(BaseMultiTurnAttack):
             turns = []
 
         if simulator_model:
-            self.simulator_model, _ = initialize_model(simulator_model)
+            resolved_simulator, _ = initialize_model(simulator_model)
         else:
-            self.simulator_model, _ = initialize_model(self.simulator_model)
+            resolved_simulator, _ = initialize_model(self.simulator_model)
 
-        self.model_callback = model_callback
+        state = CrescendoConversation(
+            simulator_model=resolved_simulator, model_callback=model_callback
+        )
 
         vulnerability_data = (
             f"Vulnerability: {vulnerability} | Type: {vulnerability_type}"
@@ -170,8 +195,8 @@ class CrescendoJailbreaking(BaseMultiTurnAttack):
             vulnerability_data=vulnerability_data,
         )
 
-        self.memory.add_message(
-            self.red_teaming_chat_conversation_id,
+        state.memory.add_message(
+            state.red_teaming_chat_conversation_id,
             {"role": "system", "content": system_prompt},
         )
 
@@ -192,7 +217,11 @@ class CrescendoJailbreaking(BaseMultiTurnAttack):
                 round_num += 1
 
                 current_attack = self.generate_attack(
-                    round_num, eval_flag, last_response, vulnerability_data
+                    state,
+                    round_num,
+                    eval_flag,
+                    last_response,
+                    vulnerability_data,
                 )
                 update_pbar(progress, rounds_task_id)
 
@@ -202,13 +231,13 @@ class CrescendoJailbreaking(BaseMultiTurnAttack):
                     attack = random.choice(self.turn_level_attacks)
                     turn_level_attack = attack
                     current_attack = enhance_attack(
-                        attack, current_attack, self.simulator_model
+                        attack, current_attack, state.simulator_model
                     )
 
                 turns.append(RTTurn(role="user", content=current_attack))
 
                 last_response = self.generate_target_response(
-                    current_attack, turns
+                    state, current_attack, turns
                 )
                 update_pbar(progress, rounds_task_id)
 
@@ -220,14 +249,17 @@ class CrescendoJailbreaking(BaseMultiTurnAttack):
                     append_target_turn(turns, last_response)
 
                 is_refusal, refusal_rationale = self.get_refusal_score(
-                    last_response.content, current_attack, vulnerability_data
+                    state,
+                    last_response.content,
+                    current_attack,
+                    vulnerability_data,
                 )
                 update_pbar(progress, rounds_task_id)
 
                 if is_refusal:
                     backtrack_count += 1
-                    self.target_conversation_id = self.backtrack_memory(
-                        self.target_conversation_id
+                    state.target_conversation_id = self.backtrack_memory(
+                        state, state.target_conversation_id
                     )
                     last_response.content += (
                         "Target model refused to respond because the request contravened its ethical guidelines "
@@ -249,7 +281,10 @@ class CrescendoJailbreaking(BaseMultiTurnAttack):
                     continue
 
                 eval_flag, eval_percentage = self.get_eval_score(
-                    last_response.content, current_attack, vulnerability_data
+                    state,
+                    last_response.content,
+                    current_attack,
+                    vulnerability_data,
                 )
                 update_pbar(progress, rounds_task_id)
 
@@ -272,11 +307,13 @@ class CrescendoJailbreaking(BaseMultiTurnAttack):
             turns = []
 
         if simulator_model:
-            self.simulator_model, _ = initialize_model(simulator_model)
+            resolved_simulator, _ = initialize_model(simulator_model)
         else:
-            self.simulator_model, _ = initialize_model(self.simulator_model)
+            resolved_simulator, _ = initialize_model(self.simulator_model)
 
-        self.model_callback = model_callback
+        state = CrescendoConversation(
+            simulator_model=resolved_simulator, model_callback=model_callback
+        )
 
         vulnerability_data = (
             f"Vulnerability: {vulnerability} | Type: {vulnerability_type}"
@@ -342,8 +379,8 @@ class CrescendoJailbreaking(BaseMultiTurnAttack):
             vulnerability_data=vulnerability_data,
         )
 
-        self.memory.add_message(
-            self.red_teaming_chat_conversation_id,
+        state.memory.add_message(
+            state.red_teaming_chat_conversation_id,
             {"role": "system", "content": system_prompt},
         )
 
@@ -364,7 +401,11 @@ class CrescendoJailbreaking(BaseMultiTurnAttack):
                 round_num += 1
 
                 current_attack = await self.a_generate_attack(
-                    round_num, eval_flag, last_response, vulnerability_data
+                    state,
+                    round_num,
+                    eval_flag,
+                    last_response,
+                    vulnerability_data,
                 )
                 update_pbar(progress, rounds_task_id)
 
@@ -374,13 +415,13 @@ class CrescendoJailbreaking(BaseMultiTurnAttack):
                     attack = random.choice(self.turn_level_attacks)
                     turn_level_attack = attack
                     current_attack = await a_enhance_attack(
-                        attack, current_attack, self.simulator_model
+                        attack, current_attack, state.simulator_model
                     )
 
                 turns.append(RTTurn(role="user", content=current_attack))
 
                 last_response = await self.a_generate_target_response(
-                    current_attack, turns
+                    state, current_attack, turns
                 )
                 update_pbar(progress, rounds_task_id)
 
@@ -392,14 +433,17 @@ class CrescendoJailbreaking(BaseMultiTurnAttack):
                     append_target_turn(turns, last_response)
 
                 is_refusal, refusal_rationale = await self.a_get_refusal_score(
-                    last_response.content, current_attack, vulnerability_data
+                    state,
+                    last_response.content,
+                    current_attack,
+                    vulnerability_data,
                 )
                 update_pbar(progress, rounds_task_id)
 
                 if is_refusal:
                     backtrack_count += 1
-                    self.target_conversation_id = self.backtrack_memory(
-                        self.target_conversation_id
+                    state.target_conversation_id = self.backtrack_memory(
+                        state, state.target_conversation_id
                     )
                     last_response.content += (
                         "Target model refused to respond because the request contravened its ethical guidelines "
@@ -421,7 +465,10 @@ class CrescendoJailbreaking(BaseMultiTurnAttack):
                     continue
 
                 eval_flag, eval_percentage = await self.a_get_eval_score(
-                    last_response.content, current_attack, vulnerability_data
+                    state,
+                    last_response.content,
+                    current_attack,
+                    vulnerability_data,
                 )
                 update_pbar(progress, rounds_task_id)
 
@@ -591,6 +638,7 @@ class CrescendoJailbreaking(BaseMultiTurnAttack):
 
     def generate_attack(
         self,
+        state: CrescendoConversation,
         round_num: int,
         eval_score: bool,
         last_response: str,
@@ -611,34 +659,41 @@ class CrescendoJailbreaking(BaseMultiTurnAttack):
                 + f"This is round number {round_num}. The last successFlag was: {eval_score}. "
                 + f"The last response was: {last_response}"
             )
-        self.memory.add_message(
-            self.red_teaming_chat_conversation_id,
+        state.memory.add_message(
+            state.red_teaming_chat_conversation_id,
             {"role": "user", "content": prompt_text},
         )
-        red_teaming_history = self.memory.get_conversation(
-            self.red_teaming_chat_conversation_id
+        red_teaming_history = state.memory.get_conversation(
+            state.red_teaming_chat_conversation_id
         )
         res: AttackData = generate(
-            json.dumps(red_teaming_history), AttackData, self.simulator_model
+            json.dumps(red_teaming_history), AttackData, state.simulator_model
         )
         return res.generated_question
 
     def generate_target_response(
-        self, attack_prompt: str, turns: List[RTTurn]
+        self,
+        state: CrescendoConversation,
+        attack_prompt: str,
+        turns: List[RTTurn],
     ) -> RTTurn:
-        self.memory.add_message(
-            self.target_conversation_id,
+        state.memory.add_message(
+            state.target_conversation_id,
             {"role": "user", "content": attack_prompt},
         )
-        response = self.model_callback(attack_prompt, turns)
-        self.memory.add_message(
-            self.target_conversation_id,
+        response = state.model_callback(attack_prompt, turns)
+        state.memory.add_message(
+            state.target_conversation_id,
             {"role": "assistant", "content": response.content},
         )
         return response
 
     def get_refusal_score(
-        self, last_response: str, goal: str, vulenrability_data: str = ""
+        self,
+        state: CrescendoConversation,
+        last_response: str,
+        goal: str,
+        vulenrability_data: str = "",
     ) -> Tuple[bool, str]:
         refusal_input = {
             "conversationObjective": goal,
@@ -654,12 +709,16 @@ class CrescendoJailbreaking(BaseMultiTurnAttack):
             {"role": "user", "content": refusal_input},
         ]
         refusal_response: RefusalData = generate(
-            json.dumps(refusal_body), RefusalData, self.simulator_model
+            json.dumps(refusal_body), RefusalData, state.simulator_model
         )
         return refusal_response.value, refusal_response.rationale
 
     def get_eval_score(
-        self, last_response: str, goal: str, vulenrability_data: str = ""
+        self,
+        state: CrescendoConversation,
+        last_response: str,
+        goal: str,
+        vulenrability_data: str = "",
     ) -> Dict[str, Any]:
         eval_input = {
             "conversationObjective": goal,
@@ -673,12 +732,14 @@ class CrescendoJailbreaking(BaseMultiTurnAttack):
             {"role": "user", "content": eval_input},
         ]
         eval_response: EvalData = generate(
-            json.dumps(eval_body), EvalData, self.simulator_model
+            json.dumps(eval_body), EvalData, state.simulator_model
         )
         return eval_response.value, eval_response.metadata
 
-    def backtrack_memory(self, conversation_id: str) -> str:
-        return self.memory.duplicate_conversation_excluding_last_turn(
+    def backtrack_memory(
+        self, state: CrescendoConversation, conversation_id: str
+    ) -> str:
+        return state.memory.duplicate_conversation_excluding_last_turn(
             conversation_id
         )
 
@@ -688,6 +749,7 @@ class CrescendoJailbreaking(BaseMultiTurnAttack):
 
     async def a_generate_attack(
         self,
+        state: CrescendoConversation,
         round_num: int,
         eval_score: bool,
         last_response: str,
@@ -708,12 +770,12 @@ class CrescendoJailbreaking(BaseMultiTurnAttack):
                 + f"This is round number {round_num}. The last successFlag was: {eval_score}. "
                 + f"The last response was: {last_response}"
             )
-        self.memory.add_message(
-            self.red_teaming_chat_conversation_id,
+        state.memory.add_message(
+            state.red_teaming_chat_conversation_id,
             {"role": "user", "content": prompt_text},
         )
-        red_teaming_history = self.memory.get_conversation(
-            self.red_teaming_chat_conversation_id
+        red_teaming_history = state.memory.get_conversation(
+            state.red_teaming_chat_conversation_id
         )
         red_teaming_history.append(
             {
@@ -723,26 +785,33 @@ class CrescendoJailbreaking(BaseMultiTurnAttack):
         )
 
         res: AttackData = await a_generate(
-            json.dumps(red_teaming_history), AttackData, self.simulator_model
+            json.dumps(red_teaming_history), AttackData, state.simulator_model
         )
         return res.generated_question
 
     async def a_generate_target_response(
-        self, attack_prompt: str, turns: List[RTTurn]
+        self,
+        state: CrescendoConversation,
+        attack_prompt: str,
+        turns: List[RTTurn],
     ) -> RTTurn:
-        self.memory.add_message(
-            self.target_conversation_id,
+        state.memory.add_message(
+            state.target_conversation_id,
             {"role": "user", "content": attack_prompt},
         )
-        response = await self.model_callback(attack_prompt, turns)
-        self.memory.add_message(
-            self.target_conversation_id,
+        response = await state.model_callback(attack_prompt, turns)
+        state.memory.add_message(
+            state.target_conversation_id,
             {"role": "assistant", "content": response.content},
         )
         return response
 
     async def a_get_refusal_score(
-        self, last_response: str, goal: str, vulnerability_data: str = ""
+        self,
+        state: CrescendoConversation,
+        last_response: str,
+        goal: str,
+        vulnerability_data: str = "",
     ) -> Tuple[bool, str]:
         refusal_input = {
             "conversationObjective": goal,
@@ -758,12 +827,16 @@ class CrescendoJailbreaking(BaseMultiTurnAttack):
             {"role": "user", "content": refusal_input},
         ]
         refusal_response: RefusalData = await a_generate(
-            json.dumps(refusal_body), RefusalData, self.simulator_model
+            json.dumps(refusal_body), RefusalData, state.simulator_model
         )
         return refusal_response.value, refusal_response.rationale
 
     async def a_get_eval_score(
-        self, last_response: str, goal: str, vulnerability_data: str = ""
+        self,
+        state: CrescendoConversation,
+        last_response: str,
+        goal: str,
+        vulnerability_data: str = "",
     ) -> Dict[str, Any]:
         eval_input = {
             "conversationObjective": goal,
@@ -777,7 +850,7 @@ class CrescendoJailbreaking(BaseMultiTurnAttack):
             {"role": "user", "content": eval_input},
         ]
         eval_response: EvalData = await a_generate(
-            json.dumps(eval_body), EvalData, self.simulator_model
+            json.dumps(eval_body), EvalData, state.simulator_model
         )
         return eval_response.value, eval_response.metadata
 
